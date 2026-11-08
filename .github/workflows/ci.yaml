@@ -1,0 +1,78 @@
+name: Build Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+      - release
+  push:
+    branches:
+      - main
+      - develop
+      - release
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Test Python service
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pytest
+          pip install pip-audit
+#pip-audit -r requirements-runtime.txt
+
+
+      - name: Scan source and Terraform configuration
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          #severity: HIGH,CRITICAL
+          severity: CRITICAL
+          exit-code: '1'
+
+      - name: SonarCloud Scan
+        if: ${{ vars.SONAR_ENABLED == 'true' }}
+        uses: SonarSource/sonarqube-scan-action@v5.0.0
+        with:
+          args: >
+            -Dsonar.projectKey=backstage-backend_${{ github.event.repository.name }}
+            -Dsonar.organization=backstage-backend
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Run Terraform validation
+        working-directory: terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
+
+

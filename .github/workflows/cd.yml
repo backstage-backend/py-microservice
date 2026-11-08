@@ -1,0 +1,166 @@
+name: Continuous Delivery
+
+on:
+  workflow_run:
+    workflows:
+      - Build Validation
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME || secrets.EKS_CLUSTER_NAME }}
+  TF_STATE_KEY: services/py-microservice/lambda.tfstate
+  DEPLOYMENT: lambda
+
+jobs:
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    name: deploy-lambda
+    runs-on: ubuntu-latest
+    environment: aws-infrastructure
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate deployment configuration
+        run: |
+          test -n "$AWS_REGION" || { echo "::error::AWS_REGION is required in the aws-infrastructure environment"; exit 1; }
+
+
+          test -n "${{ vars.API_GATEWAY_NAME }}" || { echo "::error::API_GATEWAY_NAME is required in the aws-infrastructure environment"; exit 1; }
+
+
+
+
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements-runtime.txt -t src
+
+
+
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Terraform init
+        working-directory: terraform
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+          TF_VAR_api_gateway_name: ${{ vars.API_GATEWAY_NAME }}
+          TF_VAR_eks_cluster_name: ${{ env.EKS_CLUSTER_NAME }}
+        run: |
+          test -n "$TF_STATE_BUCKET" || { echo "::error::TF_STATE_BUCKET is required"; exit 1; }
+          test -n "$TF_VAR_aws_region" || { echo "::error::AWS_REGION is required"; exit 1; }
+          if [ "$DEPLOYMENT" = "lambda" ]; then
+            test -n "$TF_VAR_api_gateway_name" || { echo "::error::API_GATEWAY_NAME is required"; exit 1; }
+          else
+            test -n "$TF_VAR_eks_cluster_name" || { echo "::error::EKS_CLUSTER_NAME is required"; exit 1; }
+          fi
+          terraform init \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true"
+          if [ "$DEPLOYMENT" = "lambda" ]; then
+            terraform state rm aws_api_gateway_stage.service 2>/dev/null || true
+          fi
+
+
+      - name: Remove orphaned API Gateway methods
+        env:
+          API_GATEWAY_NAME: ${{ vars.API_GATEWAY_NAME }}
+        run: |
+          api_gateway_id="$(aws apigateway get-rest-apis \
+            --query "items[?name=='$API_GATEWAY_NAME'].id | [0]" \
+            --output text)"
+          if [ -z "$api_gateway_id" ] || [ "$api_gateway_id" = "None" ]; then
+            echo "::error::API Gateway '$API_GATEWAY_NAME' was not found"
+            exit 1
+          fi
+          aws apigateway get-resources \
+            --rest-api-id "$api_gateway_id" \
+            --embed methods \
+            --output json |
+            jq -r '.items[] | select(.resourceMethods != null) | [.id, (.resourceMethods | keys[])] | @tsv' |
+            while IFS=$'\t' read -r resource_id http_method; do
+              method_json="$(aws apigateway get-method \
+                --rest-api-id "$api_gateway_id" \
+                --resource-id "$resource_id" \
+                --http-method "$http_method")"
+              if ! jq -e '.methodIntegration' >/dev/null <<<"$method_json"; then
+                echo "Removing orphaned API Gateway method $http_method on resource $resource_id"
+                aws apigateway delete-method \
+                  --rest-api-id "$api_gateway_id" \
+                  --resource-id "$resource_id" \
+                  --http-method "$http_method"
+              fi
+            done
+
+
+      - name: Terraform apply
+        working-directory: terraform
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+          TF_VAR_api_gateway_name: ${{ vars.API_GATEWAY_NAME }}
+          TF_VAR_eks_cluster_name: ${{ env.EKS_CLUSTER_NAME }}
+        run: |
+          if [ "$DEPLOYMENT" = "lambda" ]; then
+            terraform apply -auto-approve
+          else
+            terraform apply -auto-approve -var="container_image=$IMAGE"
+          fi
+
+
+
+
+
+      - name: Update shared API Gateway stage
+        working-directory: terraform
+        env:
+          API_GATEWAY_NAME: ${{ vars.API_GATEWAY_NAME }}
+          API_GATEWAY_STAGE: prod
+        run: |
+          api_gateway_id="$(aws apigateway get-rest-apis \
+            --query "items[?name=='$API_GATEWAY_NAME'].id | [0]" \
+            --output text)"
+          deployment_id="$(terraform output -raw api_gateway_deployment_id)"
+          if [ -z "$api_gateway_id" ] || [ "$api_gateway_id" = "None" ]; then
+            echo "::error::API Gateway '$API_GATEWAY_NAME' was not found"
+            exit 1
+          fi
+          if aws apigateway get-stage \
+            --rest-api-id "$api_gateway_id" \
+            --stage-name "$API_GATEWAY_STAGE" >/dev/null 2>&1; then
+            aws apigateway update-stage \
+              --rest-api-id "$api_gateway_id" \
+              --stage-name "$API_GATEWAY_STAGE" \
+              --patch-operations "op=replace,path=/deploymentId,value=$deployment_id"
+          else
+            aws apigateway create-stage \
+              --rest-api-id "$api_gateway_id" \
+              --stage-name "$API_GATEWAY_STAGE" \
+              --deployment-id "$deployment_id"
+          fi
+

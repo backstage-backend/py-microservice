@@ -1,0 +1,28 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: py-microservice
+  description: Prueba de integración entre Backstage y GitHub
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+    platform.wenia.com/template: microservice
+    platform.wenia.com/template-version: '1'
+spec:
+  type: service
+  lifecycle: experimental
+  owner: group:default/transactions
+  providesApis:
+    - py-microservice-transactions
+
+---
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: py-microservice-transactions
+  description: 'API for py-microservice: transactions'
+spec:
+  type: openapi
+  lifecycle: experimental
+  owner: group:default/transactions
+  definition:
+    $text: ./docs/openapi.yaml
